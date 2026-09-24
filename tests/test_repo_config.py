@@ -135,11 +135,25 @@ def test_parse_repo_config_rejects_bad_toml():
         repo_config.parse_repo_config('base_branch = "unterminated')
 
 
-def test_parse_repo_config_rejects_unknown_key():
-    with pytest.raises(
-        repo_config.RepoConfigError, match=r"unknown key\(s\): mystery",
-    ):
-        repo_config.parse_repo_config('mystery = "x"\n')
+def test_parse_repo_config_ignores_unknown_key_with_warning(caplog):
+    """Issue #1329: an unknown key is ignored with a warning instead of failing the claim."""
+    with caplog.at_level(logging.WARNING):
+        policy = repo_config.parse_repo_config(
+            'active_milestone = "v1.0.0"\nsome_future_key = true\n'
+        )
+    assert policy.active_milestone == "v1.0.0"
+    assert policy.ignored_keys == ("some_future_key",)
+    assert "repo_config_ignored_key" in caplog.text
+    assert "some_future_key" in caplog.text
+    assert repo_config.__version__ in caplog.text
+
+
+def test_parse_repo_config_invalid_value_for_known_key_fails_fast():
+    """A known key with an invalid value still raises (typo is not a future key)."""
+    with pytest.raises(repo_config.RepoConfigError):
+        repo_config.parse_repo_config('active_milestone = 123\n')
+    with pytest.raises(repo_config.RepoConfigError):
+        repo_config.parse_repo_config('clarify_thin_tickets = "invalid"\n')
 
 
 @pytest.mark.parametrize(
@@ -322,6 +336,14 @@ def test_repo_config_audit_changed_without_previous_content():
     assert "repo_config_diff" not in fields
 
 
+def test_repo_config_audit_reports_ignored_keys():
+    policy = repo_config.RepoPolicy(ignored_keys=("some_future_key", "another_key"))
+    fields = repo_config.repo_config_audit(
+        "sha", policy, previous_sha="sha", previous_policy=policy,
+    )
+    assert fields["repo_config_ignored"] == "some_future_key, another_key"
+
+
 # --- read pipeline ----------------------------------------------------------
 
 def test_read_repo_config_returns_sha_and_policy():
@@ -441,9 +463,9 @@ def test_read_repo_config_decoded_size_cap_fails_fast():
 
 def test_read_repo_config_invalid_policy_fails_fast():
     def bad(command, **kwargs):
-        return json.dumps({"sha": "x", "content": _b64("nope = 1\n")})
+        return json.dumps({"sha": "x", "content": _b64("source_repos = ['a']\n")})
 
-    with pytest.raises(repo_config.RepoConfigError, match="unknown key"):
+    with pytest.raises(repo_config.RepoConfigError, match="host-only"):
         repo_config.read_repo_config("owner/repo", run_command=bad)
 
 

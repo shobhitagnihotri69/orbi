@@ -32,6 +32,7 @@ import tomllib
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Callable, cast
 
+from orbi import __version__
 from orbi.delivery_labels import LIFECYCLE_STATES, READY_LABEL
 from orbi.journal import event, run_command
 
@@ -147,17 +148,21 @@ class RepoPolicy:
     release_confirmation: bool | None = None
     clarify_thin_tickets: bool | None = None
     sha: str | None = None
+    ignored_keys: tuple[str, ...] = ()
 
 
 def parse_repo_config(text: str, *, source: str = REPO_CONFIG_PATH) -> RepoPolicy:
     """Parse and strictly validate one repository policy file.
 
     Returns the validated :class:`RepoPolicy` (only whitelisted keys,
-    validated values). A TOML error, an unknown key, a host-only key or a
-    wrong type raises :class:`RepoConfigError` naming the offending
-    key(s) — the claim then fails fast with a readable reason (Issue
-    #527 acceptance). A key in :data:`LEGACY_IGNORED_KEYS` is skipped
-    instead of rejected.
+    validated values). A TOML error, a host-only key or a wrong type
+    raises :class:`RepoConfigError` naming the offending key(s) — the
+    claim then fails fast with a readable reason (Issue #527 acceptance).
+    Keys that are not recognized policy keys and not host-only are ignored
+    with a warning so newer repository configs do not deadlock older engine
+    releases; new policy keys must be safe to ignore by older engines
+    (Issue #1329). A key in :data:`LEGACY_IGNORED_KEYS` is skipped instead
+    of rejected.
     """
     try:
         data = tomllib.loads(text)
@@ -173,9 +178,13 @@ def parse_repo_config(text: str, *, source: str = REPO_CONFIG_PATH) -> RepoPolic
         key for key in data
         if key not in POLICY_KEYS and key not in LEGACY_IGNORED_KEYS
     )
-    if unknown:
-        raise RepoConfigError(
-            f"{source}: unknown key(s): " + ", ".join(unknown)
+    for key in unknown:
+        event(
+            "repo_config_ignored_key",
+            level=logging.WARNING,
+            key=key,
+            engine_version=__version__,
+            source=source,
         )
     values = {
         key: _validate_value(key, data[key], source=source)
@@ -206,6 +215,7 @@ def parse_repo_config(text: str, *, source: str = REPO_CONFIG_PATH) -> RepoPolic
         clarify_thin_tickets=cast(
             "bool | None", values.get("clarify_thin_tickets")
         ),
+        ignored_keys=tuple(unknown),
     )
 
 
@@ -370,7 +380,7 @@ def policy_diff(old: RepoPolicy | None, new: RepoPolicy) -> str | None:
     parts = []
     for field in sorted(
         item.name for item in dataclasses.fields(RepoPolicy)
-        if item.name != "sha"
+        if item.name not in {"sha", "ignored_keys"}
     ):
         old_value = getattr(old, field) if old is not None else None
         new_value = getattr(new, field)
@@ -390,9 +400,12 @@ def repo_config_audit(sha: str | None, policy: RepoPolicy, *,
     Always carries nothing (the caller adds `repo_config: <sha>` to the
     run info). When the previous run recorded a different sha, adds the
     `repo_config_changed` marker and, when the previous content was
-    readable, the effective policy diff summary.
+    readable, the effective policy diff summary. When unknown keys were
+    ignored, reports them under `repo_config_ignored`.
     """
     fields: dict = {}
+    if policy.ignored_keys:
+        fields["repo_config_ignored"] = ", ".join(policy.ignored_keys)
     if not previous_sha or previous_sha == sha:
         return fields
     fields["repo_config_changed"] = f"{previous_sha}..{sha}"
